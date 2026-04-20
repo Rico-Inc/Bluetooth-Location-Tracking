@@ -22,15 +22,18 @@ Test without hardware:
 """
 
 import json
+import os
 import sqlite3
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from collections import defaultdict
 
+import serial.tools.list_ports
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 import paho.mqtt.client as mqtt
 
 # ─────────────────────────────────────────────
@@ -41,6 +44,8 @@ MQTT_PORT = 1883
 MQTT_TOPIC = "ble/readings"
 
 DB_PATH = "ble_tracking.db"
+
+FIRMWARE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "firmware"))
 
 # Location engine settings
 WINDOW_SECONDS = 60           # 60-second averaging window
@@ -596,6 +601,7 @@ NAV_HTML = """
         <a href="/admin/locations">Locations</a>
         <a href="/admin/history">History</a>
         <a href="/admin/health">Receivers</a>
+        <a href="/admin/flash">Flash Receiver</a>
         <a href="/docs">API Docs</a>
     </nav>
 """
@@ -1119,6 +1125,188 @@ def admin_health():
             <thead><tr><th>Location</th><th>MAC Address</th><th>Status</th><th>WiFi Signal</th><th>Last Seen</th><th>Age</th></tr></thead>
             <tbody>{rows}</tbody>
         </table>
+    </body>
+    </html>
+    """
+
+
+# --- Flash Receiver ---
+
+def find_pio():
+    """Locate the PlatformIO CLI executable."""
+    for name in ["pio", "platformio"]:
+        try:
+            result = subprocess.run([name, "--version"], capture_output=True, text=True)
+            if result.returncode == 0:
+                return name
+        except FileNotFoundError:
+            continue
+    home = os.path.expanduser("~")
+    fallback = os.path.join(home, ".platformio", "penv", "Scripts", "pio.exe")
+    return fallback if os.path.isfile(fallback) else None
+
+
+@app.get("/api/flash/ports")
+def flash_ports():
+    """Return list of available COM ports."""
+    ports = serial.tools.list_ports.comports()
+    return [
+        {"device": p.device, "description": p.description}
+        for p in sorted(ports, key=lambda x: x.device)
+    ]
+
+
+@app.get("/api/flash/stream")
+def flash_stream(port: str):
+    """SSE endpoint — runs PlatformIO upload and streams output line by line."""
+    def generate():
+        pio = find_pio()
+        if not pio:
+            yield "data: ERROR: PlatformIO not found. Install with: pip install platformio\n\n"
+            yield "event: done\ndata: 1\n\n"
+            return
+
+        cmd = [pio, "run", "--target", "upload", "--upload-port", port]
+        yield f"data: Running: {' '.join(cmd)}\n\n"
+        yield f"data: Firmware dir: {FIRMWARE_DIR}\n\n"
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=FIRMWARE_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            for line in proc.stdout:
+                # SSE requires each message on its own "data:" line
+                for part in line.rstrip("\n").splitlines():
+                    yield f"data: {part}\n\n"
+            proc.wait()
+            yield f"event: done\ndata: {proc.returncode}\n\n"
+        except Exception as exc:
+            yield f"data: Exception: {exc}\n\n"
+            yield "event: done\ndata: 1\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.get("/admin/flash", response_class=HTMLResponse)
+def admin_flash():
+    ports = serial.tools.list_ports.comports()
+    port_options = "".join(
+        f'<option value="{p.device}">{p.device} — {p.description}</option>'
+        for p in sorted(ports, key=lambda x: x.device)
+    )
+    if not port_options:
+        port_options = '<option value="">No COM ports found</option>'
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>BLE Tracking — Flash Receiver</title>
+        <style>
+            {COMMON_STYLES}
+            #output {{
+                background: #1e1e1e;
+                color: #d4d4d4;
+                font-family: Consolas, monospace;
+                font-size: 13px;
+                padding: 14px;
+                border-radius: 4px;
+                height: 420px;
+                overflow-y: auto;
+                white-space: pre-wrap;
+                margin-top: 16px;
+            }}
+            #status-bar {{
+                margin-top: 10px;
+                font-weight: 600;
+                font-size: 14px;
+                min-height: 22px;
+            }}
+            .success {{ color: #2e7d32; }}
+            .error   {{ color: #c62828; }}
+            .running {{ color: #1a73e8; }}
+            select {{ width: 420px; }}
+            .controls {{ display: flex; align-items: center; gap: 12px; margin-top: 16px; }}
+        </style>
+    </head>
+    <body>
+        {NAV_HTML}
+        <h1>Flash Receiver Firmware</h1>
+        <p class="status">Uploads the ESP32 firmware via PlatformIO. The device must be connected via USB.</p>
+
+        <label for="port-select">COM Port</label>
+        <div class="controls">
+            <select id="port-select">{port_options}</select>
+            <button class="btn" onclick="refreshPorts()">Refresh</button>
+        </div>
+
+        <div class="controls" style="margin-top:20px;">
+            <button id="upload-btn" class="btn btn-primary" onclick="startUpload()">Upload Firmware</button>
+        </div>
+
+        <div id="status-bar"></div>
+        <div id="output"></div>
+
+        <script>
+            function refreshPorts() {{
+                fetch('/api/flash/ports')
+                    .then(r => r.json())
+                    .then(ports => {{
+                        const sel = document.getElementById('port-select');
+                        const current = sel.value;
+                        sel.innerHTML = ports.length
+                            ? ports.map(p => `<option value="${{p.device}}">${{p.device}} — ${{p.description}}</option>`).join('')
+                            : '<option value="">No COM ports found</option>';
+                        // Re-select previously chosen port if still present
+                        if ([...sel.options].some(o => o.value === current)) sel.value = current;
+                    }});
+            }}
+
+            function startUpload() {{
+                const port = document.getElementById('port-select').value;
+                if (!port) {{ setStatus('No port selected.', 'error'); return; }}
+
+                const output = document.getElementById('output');
+                const btn    = document.getElementById('upload-btn');
+                output.textContent = '';
+                btn.disabled = true;
+                setStatus('Uploading...', 'running');
+
+                const es = new EventSource('/api/flash/stream?port=' + encodeURIComponent(port));
+
+                es.onmessage = (e) => {{
+                    output.textContent += e.data + '\\n';
+                    output.scrollTop = output.scrollHeight;
+                }};
+
+                es.addEventListener('done', (e) => {{
+                    es.close();
+                    btn.disabled = false;
+                    const code = parseInt(e.data);
+                    if (code === 0) {{
+                        setStatus('✔  Upload complete.', 'success');
+                    }} else {{
+                        setStatus('✘  Upload failed — see output above.', 'error');
+                    }}
+                }});
+
+                es.onerror = () => {{
+                    es.close();
+                    btn.disabled = false;
+                    setStatus('✘  Connection lost.', 'error');
+                }};
+            }}
+
+            function setStatus(msg, cls) {{
+                const el = document.getElementById('status-bar');
+                el.textContent = msg;
+                el.className = cls || '';
+            }}
+        </script>
     </body>
     </html>
     """
