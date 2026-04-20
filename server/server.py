@@ -43,7 +43,7 @@ MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 MQTT_TOPIC = "ble/readings"
 
-DB_PATH = "ble_tracking.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ble_tracking.db")
 
 FIRMWARE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "firmware"))
 
