@@ -1133,7 +1133,6 @@ def admin_health():
 # --- Flash Receiver ---
 
 def find_pio():
-    """Locate the PlatformIO CLI executable."""
     for name in ["pio", "platformio"]:
         try:
             result = subprocess.run([name, "--version"], capture_output=True, text=True)
@@ -1148,7 +1147,6 @@ def find_pio():
 
 @app.get("/api/flash/ports")
 def flash_ports():
-    """Return list of available COM ports."""
     ports = serial.tools.list_ports.comports()
     return [
         {"device": p.device, "description": p.description}
@@ -1158,7 +1156,7 @@ def flash_ports():
 
 @app.get("/api/flash/stream")
 def flash_stream(port: str):
-    """SSE endpoint — runs PlatformIO upload and streams output line by line."""
+    """SSE — runs PlatformIO upload and streams output line by line."""
     def generate():
         pio = find_pio()
         if not pio:
@@ -1179,7 +1177,6 @@ def flash_stream(port: str):
                 text=True,
             )
             for line in proc.stdout:
-                # SSE requires each message on its own "data:" line
                 for part in line.rstrip("\n").splitlines():
                     yield f"data: {part}\n\n"
             proc.wait()
@@ -1189,6 +1186,56 @@ def flash_stream(port: str):
             yield "event: done\ndata: 1\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.get("/api/flash/capture-mac")
+def flash_capture_mac(port: str):
+    """SSE — opens serial port after flash, waits for MAC in boot output."""
+    import serial as pyserial
+
+    def generate():
+        yield "data: Waiting for device to boot...\n\n"
+        time.sleep(3)
+        try:
+            ser = pyserial.Serial(port, 115200, timeout=1)
+            start = time.time()
+            while time.time() - start < 20:
+                line = ser.readline().decode("utf-8", errors="replace").strip()
+                if line:
+                    yield f"data: {line}\n\n"
+                    if "[Info] Receiver MAC:" in line:
+                        mac = line.split("Receiver MAC:")[-1].strip()
+                        ser.close()
+                        yield f"event: mac\ndata: {mac}\n\n"
+                        yield "event: done\ndata: 0\n\n"
+                        return
+            ser.close()
+            yield "data: Timed out waiting for MAC — check device is booting.\n\n"
+            yield "event: done\ndata: 1\n\n"
+        except Exception as exc:
+            yield f"data: Error reading serial: {exc}\n\n"
+            yield "event: done\ndata: 1\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.post("/api/flash/assign")
+async def flash_assign(request: StarletteRequest):
+    """Assign a receiver MAC to a location."""
+    data = await request.json()
+    location_id = data.get("location_id")
+    receiver_mac = data.get("receiver_mac", "").strip().upper()
+
+    if not location_id or not receiver_mac:
+        raise HTTPException(400, "location_id and receiver_mac required")
+
+    with get_db() as db:
+        loc = db.execute("SELECT * FROM locations WHERE id = ?", (location_id,)).fetchone()
+        if not loc:
+            raise HTTPException(404, "Location not found")
+        db.execute("UPDATE locations SET receiver_mac = ? WHERE id = ?", (receiver_mac, location_id))
+
+    return {"status": "ok", "location_name": loc["name"], "receiver_mac": receiver_mac}
 
 
 @app.get("/admin/flash", response_class=HTMLResponse)
@@ -1215,7 +1262,7 @@ def admin_flash():
                 font-size: 13px;
                 padding: 14px;
                 border-radius: 4px;
-                height: 420px;
+                height: 360px;
                 overflow-y: auto;
                 white-space: pre-wrap;
                 margin-top: 16px;
@@ -1226,6 +1273,17 @@ def admin_flash():
                 font-size: 14px;
                 min-height: 22px;
             }}
+            #assign-box {{
+                display: none;
+                margin-top: 20px;
+                padding: 16px;
+                background: #f0f7ff;
+                border: 1px solid #b3d1f7;
+                border-radius: 6px;
+            }}
+            #assign-box h3 {{ margin: 0 0 12px 0; font-size: 15px; color: #1a4a7a; }}
+            #assign-box label {{ font-size: 14px; }}
+            #assign-box select, #assign-box input {{ width: 340px; }}
             .success {{ color: #2e7d32; }}
             .error   {{ color: #c62828; }}
             .running {{ color: #1a73e8; }}
@@ -1251,7 +1309,33 @@ def admin_flash():
         <div id="status-bar"></div>
         <div id="output"></div>
 
+        <!-- Assign to location — shown after successful upload -->
+        <div id="assign-box">
+            <h3>Assign to Location</h3>
+            <label>Detected MAC Address
+                <input type="text" id="detected-mac" placeholder="Reading from device...">
+            </label>
+            <label style="margin-top:12px;">Location
+                <select id="location-select"><option value="">Loading...</option></select>
+            </label>
+            <div style="margin-top:14px;">
+                <button class="btn btn-primary" onclick="assignLocation()">Save Assignment</button>
+            </div>
+            <div id="assign-status" style="margin-top:10px;font-weight:600;font-size:14px;"></div>
+        </div>
+
         <script>
+            // Load locations into dropdown
+            function loadLocations() {{
+                fetch('/api/locations')
+                    .then(r => r.json())
+                    .then(locs => {{
+                        const sel = document.getElementById('location-select');
+                        sel.innerHTML = '<option value="">— Select a location —</option>' +
+                            locs.map(l => `<option value="${{l.id}}">${{l.name}}</option>`).join('');
+                    }});
+            }}
+
             function refreshPorts() {{
                 fetch('/api/flash/ports')
                     .then(r => r.json())
@@ -1261,7 +1345,6 @@ def admin_flash():
                         sel.innerHTML = ports.length
                             ? ports.map(p => `<option value="${{p.device}}">${{p.device}} — ${{p.description}}</option>`).join('')
                             : '<option value="">No COM ports found</option>';
-                        // Re-select previously chosen port if still present
                         if ([...sel.options].some(o => o.value === current)) sel.value = current;
                     }});
             }}
@@ -1272,33 +1355,88 @@ def admin_flash():
 
                 const output = document.getElementById('output');
                 const btn    = document.getElementById('upload-btn');
+                document.getElementById('assign-box').style.display = 'none';
                 output.textContent = '';
                 btn.disabled = true;
                 setStatus('Uploading...', 'running');
 
                 const es = new EventSource('/api/flash/stream?port=' + encodeURIComponent(port));
 
-                es.onmessage = (e) => {{
+                es.onmessage = e => {{
                     output.textContent += e.data + '\\n';
                     output.scrollTop = output.scrollHeight;
                 }};
 
-                es.addEventListener('done', (e) => {{
+                es.addEventListener('done', e => {{
                     es.close();
                     btn.disabled = false;
                     const code = parseInt(e.data);
                     if (code === 0) {{
-                        setStatus('✔  Upload complete.', 'success');
+                        setStatus('✔  Upload complete. Reading device MAC...', 'running');
+                        captureMac(port);
                     }} else {{
                         setStatus('✘  Upload failed — see output above.', 'error');
                     }}
                 }});
 
+                es.onerror = () => {{ es.close(); btn.disabled = false; setStatus('✘  Connection lost.', 'error'); }};
+            }}
+
+            function captureMac(port) {{
+                const output = document.getElementById('output');
+                output.textContent += '\\n--- Reading boot output ---\\n';
+
+                const es = new EventSource('/api/flash/capture-mac?port=' + encodeURIComponent(port));
+
+                es.onmessage = e => {{
+                    output.textContent += e.data + '\\n';
+                    output.scrollTop = output.scrollHeight;
+                }};
+
+                es.addEventListener('mac', e => {{
+                    document.getElementById('detected-mac').value = e.data;
+                    setStatus('✔  MAC detected. Select a location and save.', 'success');
+                }});
+
+                es.addEventListener('done', e => {{
+                    es.close();
+                    loadLocations();
+                    document.getElementById('assign-box').style.display = 'block';
+                    if (parseInt(e.data) !== 0 && !document.getElementById('detected-mac').value) {{
+                        setStatus('✔  Upload done. Enter MAC manually below.', 'success');
+                    }}
+                }});
+
                 es.onerror = () => {{
                     es.close();
-                    btn.disabled = false;
-                    setStatus('✘  Connection lost.', 'error');
+                    loadLocations();
+                    document.getElementById('assign-box').style.display = 'block';
+                    setStatus('✔  Upload done. Enter MAC manually if needed.', 'success');
                 }};
+            }}
+
+            function assignLocation() {{
+                const locationId  = document.getElementById('location-select').value;
+                const receiverMac = document.getElementById('detected-mac').value.trim();
+                const statusEl    = document.getElementById('assign-status');
+
+                if (!locationId) {{ statusEl.textContent = 'Please select a location.'; statusEl.className = 'error'; return; }}
+                if (!receiverMac) {{ statusEl.textContent = 'MAC address is required.'; statusEl.className = 'error'; return; }}
+
+                fetch('/api/flash/assign', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{location_id: parseInt(locationId), receiver_mac: receiverMac}})
+                }})
+                .then(r => r.json())
+                .then(data => {{
+                    statusEl.textContent = `✔  ${{data.receiver_mac}} assigned to ${{data.location_name}}`;
+                    statusEl.className = 'success';
+                }})
+                .catch(() => {{
+                    statusEl.textContent = '✘  Assignment failed.';
+                    statusEl.className = 'error';
+                }});
             }}
 
             function setStatus(msg, cls) {{
