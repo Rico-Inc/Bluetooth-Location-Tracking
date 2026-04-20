@@ -1,5 +1,5 @@
 @echo off
-cd C:\ble-tracking
-call ble-env\Scripts\activate
-uvicorn server:app --reload --host 0.0.0.0 --port 8000
+cd C:\ble-employee-tracking\server
+call C:\ble-tracking\ble-env\Scripts\activate
+uvicorn server:app --host 0.0.0.0 --port 8000
 pause
