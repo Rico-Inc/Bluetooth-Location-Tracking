@@ -223,11 +223,6 @@ void connectMQTT() {
 }
 
 void publishReadings() {
-    if (tagCount == 0) {
-        Serial.println("[MQTT] No tags seen this window, skipping");
-        return;
-    }
-
     String json = "{\"receiver_mac\":\"";
     json += receiverMac;
     json += "\",\"readings\":[";
@@ -251,7 +246,7 @@ void publishReadings() {
     if (mqttClient.publish(MQTT_TOPIC, json.c_str())) {
         Serial.print("[MQTT] Published ");
         Serial.print(tagCount);
-        Serial.print(" tags — ");
+        Serial.print(tagCount == 1 ? " tag — " : " tags — ");
         Serial.print(json.length());
         Serial.println(" bytes");
     } else {

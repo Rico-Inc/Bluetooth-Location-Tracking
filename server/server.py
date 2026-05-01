@@ -313,6 +313,14 @@ def on_mqtt_message(client, userdata, msg):
         receiver_mac = data["receiver_mac"]
         timestamp = data.get("timestamp", datetime.now(timezone.utc).isoformat())
 
+        # Mark receiver as alive on every message, even an empty-readings heartbeat
+        engine.receiver_health[receiver_mac] = timestamp
+
+        # Store WiFi RSSI for health monitoring
+        wifi_rssi = data.get("wifi_rssi")
+        if wifi_rssi is not None:
+            engine.receiver_wifi_rssi[receiver_mac] = wifi_rssi
+
         # Store raw readings
         with get_db() as db:
             for r in data["readings"]:
@@ -324,11 +332,6 @@ def on_mqtt_message(client, userdata, msg):
         # Feed to location engine
         for r in data["readings"]:
             engine.add_reading(receiver_mac, r["tag_id"], r["rssi"], timestamp)
-
-        # Store WiFi RSSI for health monitoring
-        wifi_rssi = data.get("wifi_rssi")
-        if wifi_rssi is not None:
-            engine.receiver_wifi_rssi[receiver_mac] = wifi_rssi
 
     except Exception as e:
         print(f"[MQTT] Error processing message: {e}")
@@ -1133,16 +1136,61 @@ def admin_health():
 # --- Flash Receiver ---
 
 def find_pio():
+    """Locate the PlatformIO CLI. Returns (path, searched_paths) — path is None if not found.
+
+    Note: this server may run under the SYSTEM account (e.g., as a Windows service), in which
+    case `~` resolves to C:\\WINDOWS\\system32\\config\\systemprofile and not the install user's
+    home. So we explicitly scan C:\\Users\\* for PlatformIO installs.
+    """
+    searched = []
+
+    # 1. Try PATH
     for name in ["pio", "platformio"]:
+        searched.append(f"PATH: {name}")
         try:
             result = subprocess.run([name, "--version"], capture_output=True, text=True)
             if result.returncode == 0:
-                return name
-        except FileNotFoundError:
+                return name, searched
+        except (FileNotFoundError, OSError):
             continue
-    home = os.path.expanduser("~")
-    fallback = os.path.join(home, ".platformio", "penv", "Scripts", "pio.exe")
-    return fallback if os.path.isfile(fallback) else None
+
+    # 2. Build candidate user-home roots: current ~, all C:\Users\* profiles
+    home_roots = []
+    cur_home = os.path.expanduser("~")
+    home_roots.append(cur_home)
+    users_dir = "C:\\Users"
+    if os.path.isdir(users_dir):
+        for entry in os.listdir(users_dir):
+            full = os.path.join(users_dir, entry)
+            if os.path.isdir(full) and full not in home_roots:
+                home_roots.append(full)
+
+    # 3. For each home, check standard PlatformIO Core locations
+    for home in home_roots:
+        for rel in [
+            os.path.join(".platformio", "penv", "Scripts", "pio.exe"),
+            os.path.join(".platformio", "penv", "Scripts", "platformio.exe"),
+            os.path.join(".platformio", "penv", "bin", "pio"),
+        ]:
+            path = os.path.join(home, rel)
+            searched.append(path)
+            if os.path.isfile(path):
+                return path, searched
+
+        # 4. VSCode extension dir — scan for platformio.platformio-ide-*/penv/Scripts/pio.exe
+        vscode_ext = os.path.join(home, ".vscode", "extensions")
+        searched.append(f"{vscode_ext}\\platformio.platformio-ide-*\\...\\pio.exe")
+        if os.path.isdir(vscode_ext):
+            try:
+                for entry in os.listdir(vscode_ext):
+                    if entry.startswith("platformio."):
+                        pio_path = os.path.join(vscode_ext, entry, "penv", "Scripts", "pio.exe")
+                        if os.path.isfile(pio_path):
+                            return pio_path, searched
+            except OSError:
+                pass
+
+    return None, searched
 
 
 @app.get("/api/flash/ports")
@@ -1158,9 +1206,12 @@ def flash_ports():
 def flash_stream(port: str):
     """SSE — runs PlatformIO upload and streams output line by line."""
     def generate():
-        pio = find_pio()
+        pio, searched = find_pio()
         if not pio:
             yield "data: ERROR: PlatformIO not found. Install with: pip install platformio\n\n"
+            yield "data: Searched the following:\n\n"
+            for s in searched:
+                yield f"data:   - {s}\n\n"
             yield "event: done\ndata: 1\n\n"
             return
 
@@ -1199,19 +1250,35 @@ def flash_capture_mac(port: str):
         try:
             ser = pyserial.Serial(port, 115200, timeout=1)
             start = time.time()
-            while time.time() - start < 20:
+            mac_seen = False
+
+            # Read for up to 30s total; emit `mac` event as soon as MAC is seen,
+            # but keep streaming so the user can see MQTT connect/fail and the
+            # first publish attempt.
+            while time.time() - start < 30:
                 line = ser.readline().decode("utf-8", errors="replace").strip()
-                if line:
-                    yield f"data: {line}\n\n"
-                    if "[Info] Receiver MAC:" in line:
-                        mac = line.split("Receiver MAC:")[-1].strip()
-                        ser.close()
-                        yield f"event: mac\ndata: {mac}\n\n"
-                        yield "event: done\ndata: 0\n\n"
-                        return
+                if not line:
+                    continue
+                yield f"data: {line}\n\n"
+
+                if not mac_seen and "[Info] Receiver MAC:" in line:
+                    mac = line.split("Receiver MAC:")[-1].strip()
+                    mac_seen = True
+                    yield f"event: mac\ndata: {mac}\n\n"
+
+                # Once we've seen a successful publish, the receiver is fully online — exit
+                if mac_seen and "[MQTT] Published" in line:
+                    ser.close()
+                    yield "event: done\ndata: 0\n\n"
+                    return
+
             ser.close()
-            yield "data: Timed out waiting for MAC — check device is booting.\n\n"
-            yield "event: done\ndata: 1\n\n"
+            if mac_seen:
+                yield "data: (MAC captured but no MQTT publish seen within 30s — check WiFi/MQTT logs above)\n\n"
+                yield "event: done\ndata: 0\n\n"
+            else:
+                yield "data: Timed out waiting for MAC — check device is booting.\n\n"
+                yield "event: done\ndata: 1\n\n"
         except Exception as exc:
             yield f"data: Error reading serial: {exc}\n\n"
             yield "event: done\ndata: 1\n\n"
