@@ -257,6 +257,61 @@ Migrations are in rico-platform:
 
 ## FastAPI rewrite — step by step
 
+### Execution order (read this first)
+
+The detailed steps below are grouped by topic. Execute them in these four
+phases — don't cut over until sandbox is proven.
+
+**Phase 0 — Orient (before editing anything)**
+- [ ] Read `server/server.py` end to end. Note that today's `LocationEngine`
+      keys `readings_buffer`, `candidates`, and `current_locations` on
+      `tag_id`, and resolves locations from the local `locations` table. Both
+      of those change.
+- [ ] Confirm the Prerequisites above (Key Vault access, LAN → `*.supabase.co`
+      on 443, SQLite snapshot taken).
+- [ ] Point at **`rico-dev`** (the `*-dev` vault entries) for all of Phases 1–2.
+
+**Phase 1 — Build against sandbox (`rico-dev`)**
+- [ ] Step 1 — Dependencies
+- [ ] Step 2 — Env plumbing + startup wiring (see note below)
+- [ ] Step 3 — Employee cache (bulk-load + Realtime + 5-min reload)
+- [ ] Step 4a — Station cache (boot + hourly reload)
+- [ ] **Step 4 (NEW) — Refactor the engine** to key on employee UUID and the
+      orphan-safe location value (see Step 4-engine below). This is the
+      heaviest change; do it deliberately.
+- [ ] Step 4b — `_log_transition` as one asyncpg transaction, with snapshots
+- [ ] Step 5 — Realtime broadcast (only when a station resolves)
+- [ ] Step 6 — Remove NetSuite/`employees`/`locations` surfaces
+- [ ] Step 7 — Drop or localize `raw_readings`
+- [ ] Step 8 — Restart-safety rehydrate
+
+  > **Startup wiring — consolidate.** All of the long-lived pieces hang off the
+  > FastAPI startup event: the asyncpg pool (`statement_cache_size=0`), the MQTT
+  > client, the employee-cache bulk-load + Realtime subscription + 5-min reload
+  > loop, the station-cache load + hourly reload loop, the `current_locations`
+  > rehydrate, and the 60s `processing_loop`. Build one `startup()` that starts
+  > them in that order.
+
+**Phase 2 — Prove it (still on `rico-dev`)**
+- [ ] Step 10 — Run the full acceptance checklist. **This is the gate to
+      cutover** — every box must pass, especially: one open row per employee,
+      `employee_name` + `receiver_mac` always filled, orphan rows land with
+      `location_id = NULL`, orphan-to-orphan moves stay distinct, restart
+      preserves state, tag-reassignment writes under the new employee.
+
+**Phase 3 — Cut over to production (`rico-prod`)**
+- [ ] Resolve the Open Decisions below (esp. #2 unmatched employees, #3
+      receiver↔station binding) with Jay/Ricardo.
+- [ ] Step 9 — Backfill (run against `rico-dev` first to prove the mapping,
+      review the report, then prod).
+- [ ] Switch the vault entries to the `*-prod` set; restart pointing at
+      `rico-prod`.
+- [ ] Step 11 — Docs are already updated (`DATA_FLOW.md`); reconcile if the
+      build diverged from this playbook.
+- [ ] Keep the SQLite snapshot 30 days (see Rollback).
+
+---
+
 ### Step 1 — Dependencies
 
 Add to `server/requirements.txt`:
@@ -389,6 +444,30 @@ def rebuild_station_map():
 ```
 
 Call `rebuild_station_map()` at boot and every hour.
+
+### Step 4 (engine) — Refactor `LocationEngine` to key on employee UUID
+
+This is the heaviest single change and it's easy to under-scope, so it's
+called out on its own. Today's engine keys `readings_buffer`, `candidates`,
+and `current_locations` on `tag_id` and maps receivers via the local
+`locations` table. After the migration:
+
+- `readings_buffer` stays keyed on `tag_id` — that's what arrives over MQTT.
+- In `process_window()`, for each tag: resolve `tag → employee` via the
+  Step-3 cache (skip if unassigned), then resolve the winning
+  `receiver_mac → station` via the Step-4a cache (may be None = orphan).
+- `candidates` and `current_locations` change to key on **`employee_id`
+  (UUID)**, and the tracked value becomes the **orphan-safe location key**:
+  `station_id if station else receiver_mac` (see Step 4b for why).
+- The hold-period / hysteresis logic is unchanged — only the keys and the
+  location-resolution source change.
+- Tag deactivation / reassignment no longer clears local `employees` state;
+  the Step-3 Realtime handler owns the tag map, and history rows are never
+  mutated on reassignment.
+
+Do this before wiring `_log_transition` (Step 4b), since the transition
+consumes the resolved `employee_id`, `location_id`, `location_name`, and
+`receiver_mac` this step produces.
 
 ### Step 4b — `_log_transition` (must be one transaction, tolerates missing station)
 
