@@ -1,28 +1,30 @@
 """
 BLE Employee Location Tracking Server
 ======================================
-FastAPI + MQTT + SQLite
+FastAPI + MQTT + Supabase (Postgres via transaction pooler)
 
-Setup:
-  pip install fastapi uvicorn paho-mqtt
+Env vars required at boot (mid-migration; SQLite path is still present):
+  SUPABASE_URL                — https://<ref>.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY   — server-side, bypasses RLS
+  SUPABASE_DB_PASSWORD        — postgres password (used for asyncpg pooler DSN)
+  SUPABASE_DB_CLUSTER         — pooler cluster prefix, default "aws-1"
+  SUPABASE_DB_REGION          — pooler region segment, default "us-east-1"
+  SUPABASE_DB_URL             — full pooler DSN override; if set, used verbatim
+
+  MQTT_BROKER                 — default "localhost"
+
+Populate these from Azure Key Vault (`ricoincbikeyvault`) via start-server.bat
+or an equivalent shell wrapper. Never commit values to disk.
 
 Run:
   1. Start Mosquitto:  mosquitto -v
   2. Start server:     uvicorn server:app --reload --host 0.0.0.0 --port 8000
-
-Test without hardware:
-  mosquitto_pub -t "ble/readings" -m '{
-    "receiver_mac": "AA:BB:CC:DD:EE:01",
-    "readings": [
-      {"tag_id": "11:22:33:44:55:01", "rssi": -58},
-      {"tag_id": "11:22:33:44:55:02", "rssi": -74}
-    ],
-    "timestamp": "2026-03-03T10:00:00Z"
-  }'
 """
 
+import asyncio
 import json
 import os
+from urllib.parse import urlparse
 import sqlite3
 import subprocess
 import threading
@@ -31,17 +33,28 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from collections import defaultdict
 
+import asyncpg
+import httpx
 import serial.tools.list_ports
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
+from supabase import create_client, Client
+from realtime import AsyncRealtimeClient
 import paho.mqtt.client as mqtt
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-MQTT_BROKER = "localhost"
+MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
 MQTT_PORT = 1883
 MQTT_TOPIC = "ble/readings"
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_DB_PASSWORD = os.environ.get("SUPABASE_DB_PASSWORD", "").strip()
+SUPABASE_DB_CLUSTER = os.environ.get("SUPABASE_DB_CLUSTER", "aws-1").strip()
+SUPABASE_DB_REGION = os.environ.get("SUPABASE_DB_REGION", "us-east-1").strip()
+SUPABASE_DB_URL = os.environ.get("SUPABASE_DB_URL", "").strip()
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ble_tracking.db")
 
@@ -55,6 +68,33 @@ RSSI_THRESHOLD_WEAK = -80     # Passing through / gone
 
 # Receiver health
 RECEIVER_TIMEOUT_SECONDS = 600  # 10 min with no data = offline
+
+# Module-level Supabase/Postgres handles; populated in startup()
+supabase_client: Client | None = None
+pg_pool: asyncpg.Pool | None = None
+
+
+def _build_pooler_dsn() -> str:
+    """Assemble the transaction-pooler DSN Supabase expects for asyncpg.
+
+    Prefers SUPABASE_DB_URL if set (copied from Supabase dashboard).
+    Otherwise constructs from SUPABASE_URL + SUPABASE_DB_PASSWORD + region.
+    Uses `statement_cache_size=0` at pool-create time — pgBouncer transaction
+    mode does not support prepared statements.
+    """
+    if SUPABASE_DB_URL:
+        return SUPABASE_DB_URL
+    host = urlparse(SUPABASE_URL).hostname or ""
+    project_ref = host.split(".")[0]
+    if not project_ref or not SUPABASE_DB_PASSWORD:
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_DB_PASSWORD must be set "
+            "(or set SUPABASE_DB_URL to the full pooler connection string)"
+        )
+    return (
+        f"postgresql://postgres.{project_ref}:{SUPABASE_DB_PASSWORD}"
+        f"@{SUPABASE_DB_CLUSTER}-{SUPABASE_DB_REGION}.pooler.supabase.com:6543/postgres"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -151,19 +191,33 @@ class LocationEngine:
     Determines employee location using 'loudest signal wins' logic.
 
     Flow:
-    1. Collect RSSI readings from all receivers
-    2. Every WINDOW_SECONDS, average RSSI per receiver per tag
-    3. Strongest average = candidate location
-    4. Only log change if candidate holds for HOLD_PERIODS consecutive windows
+    1. MQTT thread buffers RSSI readings via add_reading(), keyed on tag_id.
+    2. Every WINDOW_SECONDS, process_window() averages per receiver, picks
+       the strongest, resolves tag→employee (Step 3 cache) and receiver→
+       station (Step 4a cache), and tracks candidates.
+    3. Candidate must hold for HOLD_PERIODS windows to become a confirmed
+       transition, at which point _log_transition() records it.
+
+    Key change vs. pre-migration:
+      - current_locations / candidates keyed on EMPLOYEE UUID, not tag_id.
+        Same person moving = one open row, even after tag reassignment.
+      - Location value is orphan-safe: station_id if resolved, else the
+        receiver_mac itself. Two unassigned receivers do not collapse.
     """
 
     def __init__(self):
-        # Raw RSSI buffer: {tag_id: {receiver_mac: [rssi, rssi, ...]}}
+        # Raw RSSI buffer stays keyed on tag_id — that's what MQTT delivers.
+        # {tag_id: {receiver_mac: [rssi, rssi, ...]}}
         self.readings_buffer = defaultdict(lambda: defaultdict(list))
-        # Current confirmed locations: {tag_id: location_id}
-        self.current_locations = {}
-        # Candidate tracking: {tag_id: {"location_id": id, "count": n}}
-        self.candidates = {}
+
+        # {employee_id (uuid str): location_key}
+        # location_key = station["id"] (int) if the receiver is bound to a
+        # station in netsuite_production_stations, else receiver_mac (str).
+        self.current_locations: dict[str, object] = {}
+
+        # {employee_id: {"location_key", "receiver_mac", "station", "employee", "count"}}
+        self.candidates: dict[str, dict] = {}
+
         # Receiver health: {receiver_mac: last_seen_timestamp}
         self.receiver_health = {}
         # WiFi signal strength: {receiver_mac: rssi}
@@ -171,16 +225,13 @@ class LocationEngine:
         self.lock = threading.Lock()
 
     def add_reading(self, receiver_mac, tag_id, rssi, timestamp):
-        """Buffer an incoming RSSI reading."""
+        """Buffer an incoming RSSI reading (called from the MQTT thread)."""
         with self.lock:
             self.readings_buffer[tag_id][receiver_mac].append(rssi)
             self.receiver_health[receiver_mac] = timestamp
 
-    def process_window(self):
-        """
-        Called every WINDOW_SECONDS. Averages readings, determines locations,
-        and logs changes to the database.
-        """
+    async def process_window(self):
+        """Called every WINDOW_SECONDS. Runs on the FastAPI asyncio loop."""
         with self.lock:
             buffer = dict(self.readings_buffer)
             self.readings_buffer = defaultdict(lambda: defaultdict(list))
@@ -188,82 +239,116 @@ class LocationEngine:
         if not buffer:
             return
 
-        now = datetime.now(timezone.utc).isoformat()
+        for tag_id, receivers in buffer.items():
+            emp = resolve_employee(tag_id)
+            if emp is None:
+                continue  # unassigned tag — skip silently
+            employee_id = emp["id"]
 
-        with get_db() as db:
-            # Build lookup: receiver_mac -> location_id
-            loc_rows = db.execute("SELECT id, receiver_mac FROM locations").fetchall()
-            mac_to_loc = {r["receiver_mac"]: r["id"] for r in loc_rows}
+            # Average RSSI per receiver, pick strongest (closest to 0)
+            avg_rssi = {mac: sum(rl) / len(rl) for mac, rl in receivers.items()}
+            strongest_mac = max(avg_rssi, key=avg_rssi.get)
+            strongest_rssi = avg_rssi[strongest_mac]
 
-            # Build lookup: tag_id -> employee_id
-            emp_rows = db.execute("SELECT id, tag_id FROM employees WHERE tag_id IS NOT NULL").fetchall()
-            tag_to_emp = {r["tag_id"]: r["id"] for r in emp_rows}
+            if strongest_rssi < RSSI_THRESHOLD_WEAK:
+                continue  # signal too weak — probably passing through
 
-            for tag_id, receivers in buffer.items():
-                if tag_id not in tag_to_emp:
-                    continue  # Unknown tag, skip
+            station = resolve_station(strongest_mac)
+            # Orphan-safe key: station_id if we can resolve one, else the
+            # MAC itself. Prevents two unassigned receivers from collapsing
+            # into a single "unknown" location.
+            candidate_key = station["id"] if station else strongest_mac.upper()
 
-                # Average RSSI per receiver
-                avg_rssi = {}
-                for mac, rssi_list in receivers.items():
-                    avg_rssi[mac] = sum(rssi_list) / len(rssi_list)
+            current_key = self.current_locations.get(employee_id)
+            if candidate_key == current_key:
+                # Signal confirms current location — clear any prior candidate
+                self.candidates.pop(employee_id, None)
+                continue
 
-                # Find strongest (closest to 0 = strongest)
-                strongest_mac = max(avg_rssi, key=avg_rssi.get)
-                strongest_rssi = avg_rssi[strongest_mac]
+            # Track candidate for hold period
+            cand = self.candidates.get(employee_id)
+            if cand and cand["location_key"] == candidate_key:
+                cand["count"] += 1
+                # keep the latest employee snapshot in case name/dept changed
+                cand["employee"] = emp
+            else:
+                self.candidates[employee_id] = {
+                    "location_key": candidate_key,
+                    "receiver_mac": strongest_mac.upper(),
+                    "station": station,      # None when orphan
+                    "employee": emp,
+                    "count": 1,
+                }
 
-                # Ignore if signal too weak
-                if strongest_rssi < RSSI_THRESHOLD_WEAK:
-                    continue
+            if self.candidates[employee_id]["count"] >= HOLD_PERIODS:
+                confirmed = self.candidates.pop(employee_id)
+                try:
+                    await self._log_transition(confirmed, current_key)
+                except Exception as exc:
+                    # Log but don't crash the window; keep other employees' work.
+                    # Re-adding to candidates would allow a retry next window, but
+                    # for now we drop — the receiver will re-nominate on the next
+                    # HOLD_PERIODS worth of readings.
+                    print(f"[Engine] transition write failed for {confirmed['employee']['name']}: {exc}")
 
-                # Map to location
-                if strongest_mac not in mac_to_loc:
-                    continue
-                candidate_loc = mac_to_loc[strongest_mac]
+        print(f"[Engine] Processed window — {len(buffer)} tag(s) seen")
 
-                employee_id = tag_to_emp[tag_id]
-                current_loc = self.current_locations.get(tag_id)
+    async def _log_transition(self, cand, old_key):
+        """Persist a confirmed location transition to Supabase.
 
-                if candidate_loc == current_loc:
-                    # No change, reset candidate
-                    self.candidates.pop(tag_id, None)
-                    continue
+        One transaction:
+          1. Close any open row for this employee (timestamp_out = ts)
+          2. Insert new row with timestamp_in = ts and all snapshot columns
 
-                # Track candidate for hold period
-                if tag_id in self.candidates and self.candidates[tag_id]["location_id"] == candidate_loc:
-                    self.candidates[tag_id]["count"] += 1
-                else:
-                    self.candidates[tag_id] = {"location_id": candidate_loc, "count": 1}
+        location_id / location_name are NULL when the receiver isn't bound
+        to a NetSuite station (orphan). receiver_mac is always set — that's
+        the debug trail for ops to reconcile once the NS record catches up.
+        """
+        if pg_pool is None:
+            raise RuntimeError("_log_transition called before pg_pool initialized")
 
-                # Confirm change after HOLD_PERIODS
-                if self.candidates[tag_id]["count"] >= HOLD_PERIODS:
-                    self._log_transition(db, employee_id, tag_id, current_loc, candidate_loc, now)
-                    self.candidates.pop(tag_id, None)
+        emp = cand["employee"]
+        station = cand["station"]
+        receiver_mac = cand["receiver_mac"]
+        location_id = station["id"] if station else None
+        location_name = station["name"] if station else None
+        ts = datetime.now(timezone.utc)
 
-        print(f"[Engine] Processed window — {len(buffer)} tags seen")
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE location_log SET timestamp_out = $1 "
+                    "WHERE employee_id = $2 AND timestamp_out IS NULL",
+                    ts, emp["id"],
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO location_log
+                        (employee_id, employee_name, employee_department,
+                         location_id, location_name, receiver_mac, timestamp_in)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """,
+                    emp["id"], emp["name"], emp.get("department"),
+                    location_id, location_name, receiver_mac, ts,
+                )
 
-    def _log_transition(self, db, employee_id, tag_id, old_loc, new_loc, timestamp):
-        """Record a location change in the database."""
-        # Close ONLY the most recent open location entry
-        open_entry = db.execute(
-            "SELECT id FROM location_log WHERE employee_id = ? AND timestamp_out IS NULL ORDER BY timestamp_in DESC LIMIT 1",
-            (employee_id,)
-        ).fetchone()
-
-        if open_entry:
-            db.execute(
-                "UPDATE location_log SET timestamp_out = ? WHERE id = ?",
-                (timestamp, open_entry["id"])
-            )
-
-        # Open new location
-        db.execute(
-            "INSERT INTO location_log (employee_id, location_id, timestamp_in) VALUES (?, ?, ?)",
-            (employee_id, new_loc, timestamp)
+        self.current_locations[emp["id"]] = cand["location_key"]
+        where = (
+            f"station #{station['id']} ({station['name']!r})"
+            if station else f"orphan receiver {receiver_mac}"
+        )
+        print(
+            f"[Engine] {emp['name']} ({emp['id'][:8]}...) transition: "
+            f"{old_key or '<none>'} -> {cand['location_key']}  [{where}]"
         )
 
-        self.current_locations[tag_id] = new_loc
-        print(f"[Engine] Employee {employee_id}: location {old_loc} → {new_loc}")
+        # --- Step 5: Realtime arrival broadcast (fire-and-forget) --------
+        # Only broadcast when a station resolves. Orphan-receiver rows are
+        # durable in location_log, but there's no display to notify yet.
+        if station is not None:
+            asyncio.create_task(
+                _broadcast_arrival(station["id"], emp, ts)
+            )
 
     def get_receiver_status(self):
         """Return health status of all receivers."""
@@ -281,6 +366,241 @@ class LocationEngine:
             except Exception:
                 status[mac] = {"last_seen": last_seen, "status": "unknown"}
         return status
+
+
+# ─────────────────────────────────────────────
+# EMPLOYEE CACHE (Step 3)
+# ─────────────────────────────────────────────
+# In-memory {tag_mac_upper: {id, name, department}} kept warm by:
+#   - rebuild_tag_map()               bulk load at boot + every 5 min
+#   - _on_platform_users_change()     Realtime callback (~1s on admin edits)
+# The reading path (location engine) uses resolve_employee() — dict lookup,
+# no network. Every INSERT into location_log snapshots name+department from
+# this cache so history survives later tag reassignments or user deletes.
+
+tag_to_employee: dict[str, dict] = {}
+_tag_map_lock = threading.Lock()
+_realtime_client: AsyncRealtimeClient | None = None
+
+
+def _display_name(row: dict) -> str:
+    first = (row.get("first_name") or "").strip()
+    last = (row.get("last_name") or "").strip()
+    return " ".join(p for p in (first, last) if p)
+
+
+def rebuild_tag_map():
+    """Full reload from platform_users. Called at boot and every 5 minutes."""
+    if supabase_client is None:
+        return
+    resp = (
+        supabase_client.table("platform_users")
+        .select("id, first_name, last_name, department, avatar_url, ble_tag_id")
+        .not_.is_("ble_tag_id", "null")
+        .execute()
+    )
+    new_map: dict[str, dict] = {}
+    for r in resp.data or []:
+        tag = (r.get("ble_tag_id") or "").upper()
+        if not tag:
+            continue
+        new_map[tag] = {
+            "id": r["id"],
+            "name": _display_name(r),
+            "department": r.get("department"),
+            "avatar_url": r.get("avatar_url"),
+        }
+    with _tag_map_lock:
+        tag_to_employee.clear()
+        tag_to_employee.update(new_map)
+    print(f"[Cache] tag_to_employee reloaded — {len(new_map)} tag(s)")
+
+
+def resolve_employee(tag_mac: str):
+    """Return {id, name, department} or None if this tag is unassigned."""
+    with _tag_map_lock:
+        return tag_to_employee.get(tag_mac.upper())
+
+
+def _on_platform_users_change(payload):
+    """Realtime callback for INSERT/UPDATE/DELETE on platform_users.
+
+    The realtime library invokes this synchronously — do NOT make it async
+    (it silently swallows the coroutine). Only dict mutation under a lock
+    happens here; no I/O, so sync is correct anyway.
+
+    We can't rely on old_record.ble_tag_id: `platform_users` uses
+    REPLICA IDENTITY DEFAULT (PK only), so old_record has just `id` on
+    UPDATE/DELETE. Instead: sweep any stale tag pointing at this user_id
+    and re-add the current mapping if a tag is set.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return
+    new = data.get("record") or {}
+    old = data.get("old_record") or {}
+    user_id = new.get("id") or old.get("id")
+    if not user_id:
+        return
+    new_tag = (new.get("ble_tag_id") or "").upper()
+
+    with _tag_map_lock:
+        # Drop any existing tag that maps to this user (handles tag change,
+        # tag clear, and user delete uniformly).
+        stale = [t for t, emp in tag_to_employee.items() if emp["id"] == user_id and t != new_tag]
+        for t in stale:
+            tag_to_employee.pop(t, None)
+        # Add / refresh the current mapping if the user still has a tag.
+        if new_tag:
+            tag_to_employee[new_tag] = {
+                "id": user_id,
+                "name": _display_name(new),
+                "department": new.get("department"),
+                "avatar_url": new.get("avatar_url"),
+            }
+
+
+async def _start_platform_users_realtime():
+    """Open the Realtime WebSocket and subscribe to platform_users changes.
+
+    Runs the client's listen/heartbeat loops as background tasks on the
+    FastAPI event loop; auto-reconnect is on by default. If a WS blip drops
+    events, the 5-minute reload loop catches them.
+    """
+    global _realtime_client
+    # AsyncRealtimeClient tacks "/websocket" onto whatever URL we pass — Supabase's
+    # Realtime endpoint lives under /realtime/v1, so pre-join that here.
+    realtime_url = SUPABASE_URL.rstrip("/") + "/realtime/v1"
+    _realtime_client = AsyncRealtimeClient(realtime_url, token=SUPABASE_SERVICE_ROLE_KEY)
+    await _realtime_client.connect()
+    channel = _realtime_client.channel("platform_users_changes")
+    await (
+        channel
+        .on_postgres_changes(
+            event="*",
+            schema="public",
+            table="platform_users",
+            callback=_on_platform_users_change,
+        )
+        .subscribe()
+    )
+    print("[Realtime] Subscribed to platform_users changes")
+
+
+def _tag_map_reload_loop():
+    """Every 5 minutes, full reload. Belt-and-suspenders for missed Realtime events."""
+    while True:
+        time.sleep(300)
+        try:
+            rebuild_tag_map()
+        except Exception as e:
+            print(f"[Cache] tag_to_employee reload failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# STATION CACHE (Step 4a)
+# ─────────────────────────────────────────────
+# In-memory {receiver_mac_upper: {id, name}} sourced from the
+# netsuite_production_stations mirror in Supabase. The rico-platform
+# `sweep-production-stations.ts` job refreshes that mirror twice a day
+# from NetSuite; hourly reload here is more than fast enough to notice.
+# No Realtime — mirror churn is slow, and TRUNCATE+reload during the
+# sync could produce a burst of events we don't care about.
+
+receiver_to_station: dict[str, dict] = {}
+_station_map_lock = threading.Lock()
+
+
+def rebuild_station_map():
+    """Full reload from netsuite_production_stations. Called at boot + hourly."""
+    if supabase_client is None:
+        return
+    resp = (
+        supabase_client.table("netsuite_production_stations")
+        .select("ns_internal_id, name, bt_mac_address, is_inactive")
+        .eq("is_inactive", False)
+        .not_.is_("bt_mac_address", "null")
+        .execute()
+    )
+    new_map: dict[str, dict] = {}
+    for r in resp.data or []:
+        mac = (r.get("bt_mac_address") or "").upper()
+        if not mac:
+            continue
+        new_map[mac] = {
+            "id": r["ns_internal_id"],
+            "name": r.get("name"),
+        }
+    with _station_map_lock:
+        receiver_to_station.clear()
+        receiver_to_station.update(new_map)
+    print(f"[Cache] receiver_to_station reloaded — {len(new_map)} station(s)")
+
+
+def resolve_station(receiver_mac: str):
+    """Return {id, name} for the station this receiver is bound to, or None.
+
+    None means: the receiver's MAC is not in the NS mirror. Callers must
+    still record the receiver_mac on location_log (orphan-safe write)."""
+    with _station_map_lock:
+        return receiver_to_station.get(receiver_mac.upper())
+
+
+def _station_map_reload_loop():
+    """Every hour, full reload from the mirror."""
+    while True:
+        time.sleep(3600)
+        try:
+            rebuild_station_map()
+        except Exception as e:
+            print(f"[Cache] receiver_to_station reload failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# REALTIME BROADCAST (Step 5)
+# ─────────────────────────────────────────────
+# When the engine confirms an arrival at a resolved station, publish a
+# broadcast on channel "station:<ns_internal_id>". A future station-display
+# SPA subscribes to that channel and reacts (~1s) with animations, avatars,
+# etc. Fire-and-forget: if broadcast fails (network, Supabase blip), we log
+# and move on — the transition is already durable in location_log.
+
+_broadcast_client: httpx.AsyncClient | None = None
+
+
+def _broadcast_endpoint() -> str:
+    return SUPABASE_URL.rstrip("/") + "/realtime/v1/api/broadcast"
+
+
+async def _broadcast_arrival(station_id: int, emp: dict, ts) -> None:
+    """POST an 'arrival' broadcast to station:<id>. Log on failure, never raise."""
+    global _broadcast_client
+    if _broadcast_client is None:
+        _broadcast_client = httpx.AsyncClient(timeout=5.0)
+    payload = {
+        "messages": [{
+            "topic": f"station:{station_id}",
+            "event": "arrival",
+            "payload": {
+                "user_id": str(emp["id"]),
+                "user_name": emp.get("name"),
+                "avatar_url": emp.get("avatar_url"),
+                "department": emp.get("department"),
+                "at": ts.isoformat(),
+            },
+        }],
+    }
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        r = await _broadcast_client.post(_broadcast_endpoint(), json=payload, headers=headers)
+        if r.status_code >= 400:
+            print(f"[Broadcast] station:{station_id} HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as exc:
+        print(f"[Broadcast] station:{station_id} send failed: {exc}")
 
 
 # ─────────────────────────────────────────────
@@ -349,12 +669,12 @@ def start_mqtt():
 # ─────────────────────────────────────────────
 # PROCESSING LOOP
 # ─────────────────────────────────────────────
-def processing_loop():
-    """Run location engine every WINDOW_SECONDS."""
+async def processing_loop():
+    """Run location engine every WINDOW_SECONDS on the FastAPI event loop."""
     while True:
-        time.sleep(WINDOW_SECONDS)
+        await asyncio.sleep(WINDOW_SECONDS)
         try:
-            engine.process_window()
+            await engine.process_window()
         except Exception as e:
             print(f"[Engine] Error in processing loop: {e}")
 
@@ -366,27 +686,67 @@ app = FastAPI(title="BLE Employee Tracking", version="0.1.0")
 
 
 @app.on_event("startup")
-def startup():
+async def startup():
+    global supabase_client, pg_pool
+
+    # --- Supabase REST/Realtime client -----------------------------------
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set before boot"
+        )
+    supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    print(f"[Supabase] REST client ready — {SUPABASE_URL}")
+
+    # --- asyncpg pool via transaction pooler -----------------------------
+    dsn = _build_pooler_dsn()
+    pg_pool = await asyncpg.create_pool(
+        dsn,
+        min_size=1,
+        max_size=5,
+        statement_cache_size=0,  # required for pgBouncer transaction mode
+    )
+    async with pg_pool.acquire() as conn:
+        pg_version = await conn.fetchval("SELECT version()")
+    print(f"[Postgres] Pool ready — {pg_version.split(',')[0]}")
+
+    # --- Employee cache: bulk-load + Realtime + 5-min reload -------------
+    rebuild_tag_map()
+    await _start_platform_users_realtime()
+    threading.Thread(target=_tag_map_reload_loop, daemon=True).start()
+
+    # --- Station cache: bulk-load + hourly reload ------------------------
+    rebuild_station_map()
+    threading.Thread(target=_station_map_reload_loop, daemon=True).start()
+
+    # --- Legacy SQLite path (removed in Steps 6–8) -----------------------
+    # init_db/seed_demo_data still run so /api/employees etc. keep working
+    # against the local DB during the transition.
     init_db()
     seed_demo_data()
 
-    # Reload current locations from database so we don't lose state on restart
-    with get_db() as db:
-        open_entries = db.execute("""
-            SELECT e.tag_id, ll.location_id
-            FROM location_log ll
-            JOIN employees e ON e.id = ll.employee_id
-            WHERE ll.timestamp_out IS NULL AND e.tag_id IS NOT NULL
-        """).fetchall()
-        for entry in open_entries:
-            engine.current_locations[entry["tag_id"]] = entry["location_id"]
-        if open_entries:
-            print(f"[Engine] Restored {len(open_entries)} active locations from database")
+    # TODO Step 8: rehydrate engine.current_locations from Supabase
+    # location_log open rows, keyed on employee_id. The old SQLite-based
+    # rehydrate keyed on tag_id and does not fit the new engine, so it's
+    # been removed. Until Step 8 lands, a server restart starts every
+    # employee with no prior location and rebuilds state after HOLD_PERIODS
+    # windows of readings.
 
     start_mqtt()
-    t = threading.Thread(target=processing_loop, daemon=True)
-    t.start()
+    asyncio.create_task(processing_loop())
     print("[Server] Started — MQTT listener and processing loop running")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global pg_pool, _realtime_client, _broadcast_client
+    if _realtime_client is not None:
+        await _realtime_client.close()
+        print("[Realtime] Client closed")
+    if _broadcast_client is not None:
+        await _broadcast_client.aclose()
+    if pg_pool is not None:
+        await pg_pool.close()
+        print("[Postgres] Pool closed")
 
 
 # --- Employee endpoints ---
